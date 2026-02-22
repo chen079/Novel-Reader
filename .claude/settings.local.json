@@ -14,7 +14,8 @@
       "Bash(cd:*)",
       "Bash(ls -la \"D:\\\\Novel-Reader\\\\frontend\\\\src\\\\components\"\" && ls -la \"D:Novel-Readerfrontendsrcstores\"\")",
       "Bash(npx vue-tsc:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(cd D:/Novel-Reader/frontend && npm run build 2>&1)"
     ]
   }
 }

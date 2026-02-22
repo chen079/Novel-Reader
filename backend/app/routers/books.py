@@ -156,6 +156,13 @@ async def delete_book(
     if not book:
         raise HTTPException(status_code=404, detail="书籍不存在")
 
+    # Delete associated bookmarks first
+    bookmarks_result = await db.execute(
+        select(Bookmark).where(Bookmark.book_id == book_id)
+    )
+    for bookmark in bookmarks_result.scalars().all():
+        await db.delete(bookmark)
+
     # Delete file
     file_path = os.path.join(UPLOAD_DIR, book.file_path)
     if os.path.exists(file_path):

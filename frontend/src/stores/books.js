@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '../api'
+import { getCachedBook, cacheBook, removeCachedBook } from '../utils/bookCache'
 
 export const useBooksStore = defineStore('books', () => {
   const books = ref([])
@@ -74,19 +75,41 @@ export const useBooksStore = defineStore('books', () => {
   async function openBook(bookId) {
     loading.value = true
     try {
-      const { data } = await api.get(`/books/${bookId}/content`)
-      currentBook.value = books.value.find(b => b.id === bookId) || data
-      currentContent.value = data.content
+      const bookMeta = books.value.find(b => b.id === bookId)
+      let content = null
 
-      // Restore from localStorage if newer, otherwise use backend
+      // Try IndexedDB cache first
+      const cached = await getCachedBook(bookId)
+      if (cached && bookMeta && cached.md5 === bookMeta.md5) {
+        content = cached.content
+      }
+
+      // Fallback to API if not cached or md5 mismatch
+      if (!content) {
+        const { data } = await api.get(`/books/${bookId}/content`)
+        content = data.content
+        currentBook.value = bookMeta || data
+        // Cache to IndexedDB
+        const md5 = bookMeta?.md5 || data.md5 || ''
+        await cacheBook(bookId, content, md5)
+
+        // Use backend page if no local position
+        if (!loadReadingPosition(bookId)) {
+          currentPage.value = data.current_page
+        }
+      } else {
+        currentBook.value = bookMeta
+      }
+
+      currentContent.value = content
+
+      // Restore from localStorage if available
       const localPos = loadReadingPosition(bookId)
       if (localPos && localPos.page !== undefined) {
         currentPage.value = localPos.page
-      } else {
-        currentPage.value = data.current_page
       }
 
-      const result = paginateContent(data.content)
+      const result = paginateContent(content)
       currentPages.value = result.pages
       chapters.value = result.chapters
       totalPages.value = currentPages.value.length
@@ -99,10 +122,10 @@ export const useBooksStore = defineStore('books', () => {
       await api.put(`/books/${bookId}/progress`, {
         current_page: currentPage.value,
         total_pages: totalPages.value,
-      })
+      }).catch(() => {})
 
       // Load bookmarks
-      await fetchBookmarks(bookId)
+      await fetchBookmarks(bookId).catch(() => {})
     } finally {
       loading.value = false
     }
@@ -285,6 +308,7 @@ export const useBooksStore = defineStore('books', () => {
   async function deleteBook(bookId) {
     await api.delete(`/books/${bookId}`)
     books.value = books.value.filter(b => b.id !== bookId)
+    await removeCachedBook(bookId)
   }
 
   async function updateBookMetadata(bookId, { title, author, cover_url }) {
