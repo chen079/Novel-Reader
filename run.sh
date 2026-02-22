@@ -11,7 +11,8 @@ set -e
 #    sudo ./run.sh start | stop | restart | status
 #    sudo ./run.sh nginx               # Regenerate nginx config only
 #    sudo ./run.sh build               # Rebuild frontend only
-#    sudo ./run.sh uninstall            # Remove services and nginx config
+#    sudo ./run.sh config              # Show current configuration
+#    sudo ./run.sh uninstall           # Remove services and nginx config
 # =============================================================================
 
 # ========================= Configuration =====================================
@@ -19,17 +20,25 @@ APP_NAME="novel-reader"
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$APP_DIR/backend"
 FRONTEND_DIR="$APP_DIR/frontend"
+CONF_FILE="$APP_DIR/deploy.conf"
 
+# ---------- Defaults (overridden by deploy.conf, then by CLI args) ----------
 DOMAIN="_"                      # Nginx server_name (_ = any, or set your domain)
-HTTP_PORT=80                    # Nginx listen port
+FRONTEND_PORT=3399              # Nginx listen port (frontend)
 BACKEND_HOST="127.0.0.1"       # Backend bind address
-BACKEND_PORT=8000               # Backend listen port
+BACKEND_PORT=3398               # Backend listen port
 WORKERS=4                       # Gunicorn worker count
 VENV_DIR="$BACKEND_DIR/venv"
 SERVICE_NAME="$APP_NAME"
 NGINX_CONF="/etc/nginx/sites-available/$APP_NAME"
 NGINX_LINK="/etc/nginx/sites-enabled/$APP_NAME"
 ENV_FILE="$BACKEND_DIR/.env"
+
+# ---------- Load persistent config file if exists ---------------------------
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -49,13 +58,50 @@ parse_args() {
     shift  # skip the subcommand
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --domain)   DOMAIN="$2";       shift 2 ;;
-            --port)     HTTP_PORT="$2";    shift 2 ;;
-            --workers)  WORKERS="$2";      shift 2 ;;
-            --backend-port) BACKEND_PORT="$2"; shift 2 ;;
-            *) warn "Unknown option: $1";  shift ;;
+            --domain)        DOMAIN="$2";        shift 2 ;;
+            --frontend-port) FRONTEND_PORT="$2"; shift 2 ;;
+            --port)          FRONTEND_PORT="$2"; shift 2 ;;
+            --backend-port)  BACKEND_PORT="$2";  shift 2 ;;
+            --workers)       WORKERS="$2";       shift 2 ;;
+            --save)          SAVE_CONF=1;        shift ;;
+            *) warn "Unknown option: $1";        shift ;;
         esac
     done
+}
+
+# Save current config to deploy.conf for future runs
+save_config() {
+    cat > "$CONF_FILE" <<EOF
+# Novel-Reader deploy configuration
+# Generated at $(date '+%Y-%m-%d %H:%M:%S')
+# Edit this file or use CLI args to override.
+
+DOMAIN="${DOMAIN}"
+FRONTEND_PORT=${FRONTEND_PORT}
+BACKEND_PORT=${BACKEND_PORT}
+BACKEND_HOST="${BACKEND_HOST}"
+WORKERS=${WORKERS}
+EOF
+    success "Configuration saved to $CONF_FILE"
+}
+
+show_config() {
+    echo ""
+    echo "=== Novel-Reader Configuration ==="
+    echo ""
+    echo "  DOMAIN          = $DOMAIN"
+    echo "  FRONTEND_PORT   = $FRONTEND_PORT  (nginx / frontend)"
+    echo "  BACKEND_PORT    = $BACKEND_PORT  (gunicorn / backend API)"
+    echo "  BACKEND_HOST    = $BACKEND_HOST"
+    echo "  WORKERS         = $WORKERS"
+    echo ""
+    echo "  Config file     : $CONF_FILE"
+    if [[ -f "$CONF_FILE" ]]; then
+        echo "  Config status   : loaded"
+    else
+        echo "  Config status   : using defaults (run with --save to persist)"
+    fi
+    echo ""
 }
 
 check_root() {
@@ -140,18 +186,25 @@ setup_backend() {
     "$VENV_DIR/bin/pip" install gunicorn -q
     success "Python dependencies installed"
 
-    # Generate .env file with SECRET_KEY if not exists
+    # Generate / update .env file
     if [[ ! -f "$ENV_FILE" ]]; then
         info "Generating production .env file..."
         local secret_key
         secret_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
         cat > "$ENV_FILE" <<EOF
 SECRET_KEY=$secret_key
+CORS_ORIGINS=http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}
 EOF
         chmod 600 "$ENV_FILE"
-        success "Generated .env with new SECRET_KEY"
+        success "Generated .env with SECRET_KEY and CORS_ORIGINS"
     else
-        success ".env file already exists, keeping existing config"
+        # Update CORS_ORIGINS if .env already exists
+        if grep -q "^CORS_ORIGINS=" "$ENV_FILE"; then
+            sed -i "s|^CORS_ORIGINS=.*|CORS_ORIGINS=http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}|" "$ENV_FILE"
+        else
+            echo "CORS_ORIGINS=http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}" >> "$ENV_FILE"
+        fi
+        success ".env file updated with CORS_ORIGINS for port ${FRONTEND_PORT}"
     fi
 
     # Ensure uploads directory exists
@@ -196,10 +249,11 @@ generate_nginx_config() {
 
     cat > "$NGINX_CONF" <<NGINX
 # Novel-Reader - auto-generated by run.sh
-# Domain: $DOMAIN  |  Port: $HTTP_PORT
+# Domain: $DOMAIN
+# Frontend port: $FRONTEND_PORT  |  Backend port: $BACKEND_PORT
 
 server {
-    listen ${HTTP_PORT};
+    listen ${FRONTEND_PORT};
     server_name ${DOMAIN};
 
     charset utf-8;
@@ -209,7 +263,7 @@ server {
     root ${dist_dir};
     index index.html;
 
-    # API reverse proxy
+    # API reverse proxy -> backend on port ${BACKEND_PORT}
     location /api/ {
         proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
         proxy_set_header Host \$host;
@@ -217,6 +271,13 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 300s;
+        proxy_connect_timeout 60s;
+    }
+
+    # Uploaded files
+    location /uploads/ {
+        alias ${BACKEND_DIR}/uploads/;
+        expires 7d;
     }
 
     # Vue Router history mode - all non-file requests -> index.html
@@ -240,8 +301,8 @@ NGINX
     # Enable site
     ln -sf "$NGINX_CONF" "$NGINX_LINK"
 
-    # Remove default site if it conflicts
-    if [[ -f /etc/nginx/sites-enabled/default && "$HTTP_PORT" == "80" ]]; then
+    # Remove default site if it conflicts on port 80
+    if [[ -f /etc/nginx/sites-enabled/default && "$FRONTEND_PORT" == "80" ]]; then
         warn "Removing default nginx site to avoid port 80 conflict"
         rm -f /etc/nginx/sites-enabled/default
     fi
@@ -305,6 +366,10 @@ do_deploy() {
 
     check_root
     check_deps
+
+    # Save configuration for future runs
+    save_config
+
     setup_backend
     build_frontend
     generate_nginx_config
@@ -320,17 +385,21 @@ do_deploy() {
     success "Deployment complete!"
     echo "========================================"
     echo ""
+    echo "  Backend  :  http://${BACKEND_HOST}:${BACKEND_PORT}  (API)"
+    echo "  Frontend :  port ${FRONTEND_PORT}  (nginx)"
+    echo ""
+    if [[ "$DOMAIN" == "_" ]]; then
+        echo "  URL:      http://<server-ip>:${FRONTEND_PORT}"
+    else
+        echo "  URL:      http://${DOMAIN}:${FRONTEND_PORT}"
+    fi
+    echo ""
     echo "  Service:  systemctl status $SERVICE_NAME"
     echo "  Logs:     journalctl -u $SERVICE_NAME -f"
     echo ""
-    if [[ "$DOMAIN" == "_" ]]; then
-        echo "  URL:      http://<server-ip>:${HTTP_PORT}"
-    else
-        echo "  URL:      http://${DOMAIN}:${HTTP_PORT}"
-    fi
-    echo ""
     echo "  Manage:"
     echo "    sudo ./run.sh start | stop | restart | status"
+    echo "    sudo ./run.sh config                          # show config"
     echo ""
 }
 
@@ -372,10 +441,18 @@ do_nginx() {
     generate_nginx_config
     systemctl reload nginx
     success "Nginx config regenerated and reloaded"
+    echo ""
+    echo "  Frontend listening on port ${FRONTEND_PORT}"
+    echo "  Backend  proxied to  ${BACKEND_HOST}:${BACKEND_PORT}"
+    echo ""
 }
 
 do_build() {
     build_frontend
+}
+
+do_config() {
+    show_config
 }
 
 do_uninstall() {
@@ -402,29 +479,41 @@ show_help() {
     echo "Usage: sudo ./run.sh <command> [options]"
     echo ""
     echo "Commands:"
-    echo "  deploy      Full production deployment"
+    echo "  deploy      Full production deployment (backend:3398 + frontend:3399)"
     echo "  start       Start backend service"
     echo "  stop        Stop backend service"
     echo "  restart     Restart backend + reload nginx"
     echo "  status      Show service status"
     echo "  nginx       Regenerate nginx config and reload"
     echo "  build       Rebuild frontend only"
+    echo "  config      Show current configuration"
     echo "  uninstall   Remove systemd service and nginx config"
     echo ""
     echo "Options (for deploy / nginx):"
-    echo "  --domain <name>         Server domain (default: _ for any)"
-    echo "  --port <num>            Nginx listen port (default: 80)"
-    echo "  --backend-port <num>    Backend port (default: 8000)"
-    echo "  --workers <num>         Gunicorn workers (default: 4)"
+    echo "  --domain <name>           Server domain (default: _ for any)"
+    echo "  --frontend-port <num>     Nginx listen port (default: 3399)"
+    echo "  --port <num>              Alias for --frontend-port"
+    echo "  --backend-port <num>      Backend API port (default: 3398)"
+    echo "  --workers <num>           Gunicorn workers (default: 4)"
+    echo "  --save                    Save options to deploy.conf for future runs"
+    echo ""
+    echo "Configuration:"
+    echo "  Settings are loaded from deploy.conf (auto-saved on deploy)."
+    echo "  CLI args override deploy.conf values for that run."
+    echo "  Use --save with any command to persist CLI overrides."
     echo ""
     echo "Examples:"
-    echo "  sudo ./run.sh deploy"
-    echo "  sudo ./run.sh deploy --domain reader.example.com --workers 2"
-    echo "  sudo ./run.sh nginx --domain reader.example.com --port 8080"
+    echo "  sudo ./run.sh deploy                                    # defaults: backend=3398, frontend=3399"
+    echo "  sudo ./run.sh deploy --domain reader.example.com"
+    echo "  sudo ./run.sh deploy --backend-port 8000 --frontend-port 8080"
+    echo "  sudo ./run.sh nginx --frontend-port 80 --save           # change port and persist"
+    echo "  sudo ./run.sh config                                    # view current settings"
     echo "  sudo ./run.sh restart"
 }
 
 # ========================= Main ==============================================
+
+SAVE_CONF=0
 
 case "${1:-}" in
     deploy)
@@ -437,9 +526,15 @@ case "${1:-}" in
     status)   do_status ;;
     nginx)
         parse_args "$@"
+        [[ $SAVE_CONF -eq 1 ]] && save_config
         do_nginx
         ;;
     build)    do_build ;;
+    config)
+        parse_args "$@"
+        [[ $SAVE_CONF -eq 1 ]] && save_config
+        do_config
+        ;;
     uninstall) do_uninstall ;;
     *)        show_help ;;
 esac
